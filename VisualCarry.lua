@@ -1095,13 +1095,16 @@ local function NewSwap(config)
 
     -- The game writes each name into its labels itself (the emote wheel when the loadout is set, menu slots when
     -- they are built), always the item's ORIGINAL name, and it rebuilds them whenever a page changes. So the
-    -- names are never touched in the item data: a background watcher (like the Unusual one) keeps rewriting any
-    -- label of a swapped item to its partner's name, including labels the game builds or resets later.
-    -- A label we rewrote is remembered with the text we gave it; a label that shows an original name and is
-    -- not one of ours was just written by the game, so it is rewritten again. Revert puts the old text back.
+    -- names are never touched in the item data: while something is swapped, every text label of the game's UI
+    -- is watched through its Text property, and a label of a swapped item is rewritten to its partner's name
+    -- the moment the game writes it (also labels built later). Nothing is polled, so there is no stutter.
+    -- A label we rewrote is remembered with the text we gave it; a label showing an original name that is not
+    -- one of ours was just written by the game, so it is rewritten again. Revert puts the old text back.
     local nameMap = {}      -- original text -> text to show (names and descriptions, also upper-case)
     local rewritten = setmetatable({}, { __mode = "k" }) -- label -> { Expected, Original }
-    local watching = false
+    local hooks = {}        -- label -> Text changed connection
+    local addedConnection = nil
+    local hookToken = 0
 
     local function Appearance(entry)
         local info = entry.Info
@@ -1126,33 +1129,59 @@ local function NewSwap(config)
         return player and player:FindFirstChildOfClass("PlayerGui")
     end
 
-    local function Enforce()
-        local gui = PlayerGui()
-        if not gui then return end
-        for _, label in ipairs(gui:GetDescendants()) do
-            if label:IsA("TextLabel") or label:IsA("TextButton") then
-                local text = label.Text
-                local record = rewritten[label]
-                local want = nameMap[text]
-                if want and not (record and record.Expected == text) then
-                    rewritten[label] = { Expected = want, Original = text }
-                    label.Text = want
-                elseif record and record.Expected ~= text then
-                    rewritten[label] = nil
-                end
-            end
+    local function IsText(instance)
+        return instance:IsA("TextLabel") or instance:IsA("TextButton")
+    end
+
+    local function Handle(label)
+        local text = label.Text
+        local record = rewritten[label]
+        local want = nameMap[text]
+        if want and not (record and record.Expected == text) then
+            rewritten[label] = { Expected = want, Original = text }
+            label.Text = want
+        elseif record and record.Expected ~= text then
+            rewritten[label] = nil
         end
     end
 
-    local function Watch()
-        if watching then return end
-        watching = true
+    local function Hook(label)
+        if hooks[label] then return end
+        hooks[label] = label:GetPropertyChangedSignal("Text"):Connect(function() Handle(label) end)
+        Handle(label)
+    end
+
+    local function StopWatching()
+        hookToken = hookToken + 1
+        if addedConnection then
+            addedConnection:Disconnect()
+            addedConnection = nil
+        end
+        for label, connection in pairs(hooks) do
+            connection:Disconnect()
+            hooks[label] = nil
+        end
+    end
+
+    -- Hooks every label that exists now (in small batches so the frame never hitches) and every label added later.
+    local function StartWatching()
+        if addedConnection then return end
+        local gui = PlayerGui()
+        if not gui then return end
+        hookToken = hookToken + 1
+        local mine = hookToken
+
+        addedConnection = gui.DescendantAdded:Connect(function(descendant)
+            if IsText(descendant) then Hook(descendant) end
+        end)
+
         task.spawn(function()
-            while next(nameMap) ~= nil do
-                pcall(Enforce)
-                task.wait(0.25)
+            local list = gui:GetDescendants()
+            for index, instance in ipairs(list) do
+                if mine ~= hookToken then return end
+                if IsText(instance) then pcall(Hook, instance) end
+                if index % 300 == 0 then task.wait() end
             end
-            watching = false
         end)
     end
 
@@ -1163,8 +1192,10 @@ local function NewSwap(config)
         MapText(appearanceB.Name, appearanceA.Name, true)
         MapText(appearanceA.Desc, appearanceB.Desc, true)
         MapText(appearanceB.Desc, appearanceA.Desc, true)
-        pcall(Enforce)
-        Watch()
+
+        -- labels that are already hooked and show one of the names
+        for label in pairs(hooks) do Handle(label) end
+        StartWatching()
     end
 
     local function UnlinkNames(a, b)
@@ -1181,6 +1212,7 @@ local function NewSwap(config)
                 rewritten[label] = nil
             end
         end
+        if next(nameMap) == nil then StopWatching() end
     end
 
     function Swap.Swap(base, target)
