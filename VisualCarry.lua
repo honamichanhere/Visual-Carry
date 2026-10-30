@@ -1124,6 +1124,34 @@ local function NewSwap(config)
         end
     end
 
+    -- The game writes names into its labels once (the emote wheel at SetEquipped, menu slots when built), so
+    -- labels that already exist keep the old text. Exact-text matches in the player GUI are rewritten to follow
+    -- the swap (also the upper-case form some menus use).
+    local function Relabel(map)
+        local full = {}
+        for from, to in pairs(map) do
+            if type(from) == "string" and type(to) == "string" and from ~= "" and from ~= to then
+                full[from] = to
+                full[string.upper(from)] = string.upper(to)
+            end
+        end
+        if next(full) == nil then return end
+        local playerGui = Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then return end
+        for _, gui in ipairs(playerGui:GetDescendants()) do
+            if gui:IsA("TextLabel") or gui:IsA("TextButton") then
+                local replacement = full[gui.Text]
+                if replacement then gui.Text = replacement end
+            end
+        end
+    end
+
+    local function NamesOf(entry)
+        local appearance = Appearance(entry)
+        if not appearance then return nil, nil end
+        return appearance.Name, appearance.Desc
+    end
+
     local function SwapNames(a, b)
         local appearanceA, appearanceB = Appearance(a), Appearance(b)
         if not (appearanceA and appearanceB) then return end
@@ -1151,7 +1179,12 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The swap failed: " .. tostring(err) end
 
-        pcall(SwapNames, base, target)
+        pcall(function()
+            local nameA, descA = NamesOf(base)
+            local nameB, descB = NamesOf(target)
+            SwapNames(base, target)
+            Relabel({ [nameA] = nameB, [nameB] = nameA, [descA] = descB, [descB] = descA })
+        end)
         swapped[base.Instance] = target.Instance
         swapped[target.Instance] = base.Instance
         return true, base.Display .. " ⇌ " .. target.Display
@@ -1169,8 +1202,13 @@ local function NewSwap(config)
         if not ok then return false, "The revert failed: " .. tostring(err) end
 
         pcall(function()
+            local nowA, nowDescA = NamesOf(base)
+            local nowB, nowDescB = NamesOf(target)
             RestoreNames(base)
             RestoreNames(target)
+            local backA, backDescA = NamesOf(base)
+            local backB, backDescB = NamesOf(target)
+            Relabel({ [nowA] = backA, [nowB] = backB, [nowDescA] = backDescA, [nowDescB] = backDescB })
         end)
         swapped[base.Instance] = nil
         swapped[target.Instance] = nil
