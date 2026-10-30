@@ -188,6 +188,37 @@ local function SetEnabled(button, enabled)
     button.Label.TextTransparency = enabled and 0 or 0.45
 end
 
+-- A grid whose number of columns follows the width of its scroll frame: as many columns as fit with every cell at
+-- least minCell wide (never fewer than 2). Resizing the window adds or removes columns. onChange (optional) runs
+-- shortly after the columns changed, for grids that load content for the visible cells only.
+local function ResponsiveGrid(scroll, gap, cellHeight, minCell, onChange)
+    local layout = New("UIGridLayout", {
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        CellSize = UDim2.new(1 / 3, -math.ceil(gap * 2 / 3), 0, cellHeight),
+        CellPadding = UDim2.fromOffset(gap, gap),
+    }, scroll)
+
+    local columns, token = 3, 0
+    local function Update()
+        local width = scroll.AbsoluteWindowSize.X - 9 -- the scroll frame's own side padding
+        if width <= 0 then return end
+        local count = math.max(2, math.floor((width + gap) / (minCell + gap)))
+        if count == columns then return end
+        columns = count
+        layout.CellSize = UDim2.new(1 / count, -math.ceil(gap * (count - 1) / count), 0, cellHeight)
+        if onChange then
+            token = token + 1
+            local mine = token
+            task.delay(0.15, function()
+                if mine == token then onChange() end
+            end)
+        end
+    end
+    scroll:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(Update)
+    Update()
+    return layout
+end
+
 -- The usual page layout: a row of panes (PaneHolder) above a bottom bar with a status line.
 -- The script adds its own buttons to the bottom bar.
 local BAR_H = 56
@@ -2161,11 +2192,7 @@ local function BuildCarryUI(Swap)
             PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3),
             PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 6),
         }, side.Scroll)
-        New("UIGridLayout", {
-            SortOrder = Enum.SortOrder.LayoutOrder,
-            CellSize = UDim2.new(1 / 3, -math.ceil(GAP * 2 / 3), 0, CELL_HEIGHT),
-            CellPadding = UDim2.fromOffset(GAP, GAP),
-        }, side.Scroll)
+        ResponsiveGrid(side.Scroll, GAP, CELL_HEIGHT, 88, function() RefreshVisible(side) end)
 
         -- category drawer: opens under the field and pushes the search box and the grid down,
         -- like the Mugiwara UI dropdown (dark inset list, rows with gradient / check when chosen)
