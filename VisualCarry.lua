@@ -973,7 +973,6 @@ local function NewSwap(config)
             Header = type(header) == "string" and header or "Other",
             Id = id,
             Instance = instance,
-            Info = info,
         }
         table.insert(entries, entry)
         byInstance[instance] = entry
@@ -1093,128 +1092,6 @@ local function NewSwap(config)
         end
     end
 
-    -- The game writes each name into its labels itself (the emote wheel when the loadout is set, menu slots when
-    -- they are built), always the item's ORIGINAL name, and it rebuilds them whenever a page changes. So the
-    -- names are never touched in the item data: while something is swapped, every text label of the game's UI
-    -- is watched through its Text property, and a label of a swapped item is rewritten to its partner's name
-    -- the moment the game writes it (also labels built later). Nothing is polled, so there is no stutter.
-    -- A label we rewrote is remembered with the text we gave it; a label showing an original name that is not
-    -- one of ours was just written by the game, so it is rewritten again. Revert puts the old text back.
-    local nameMap = {}      -- original text -> text to show (names and descriptions, also upper-case)
-    local rewritten = setmetatable({}, { __mode = "k" }) -- label -> { Expected, Original }
-    local hooks = {}        -- label -> Text changed connection
-    local addedConnection = nil
-    local hookToken = 0
-
-    local function Appearance(entry)
-        local info = entry.Info
-        local appearance = type(info) == "table" and info.AppearanceInfo or nil
-        return type(appearance) == "table" and appearance or nil
-    end
-
-    local function MapText(from, to, on)
-        if type(from) ~= "string" or type(to) ~= "string" or from == "" or from == to then return end
-        local upper = string.upper(from)
-        if on then
-            nameMap[from] = to
-            nameMap[upper] = string.upper(to)
-        else
-            nameMap[from] = nil
-            nameMap[upper] = nil
-        end
-    end
-
-    local function PlayerGui()
-        local player = Players.LocalPlayer
-        return player and player:FindFirstChildOfClass("PlayerGui")
-    end
-
-    local function IsText(instance)
-        return instance:IsA("TextLabel") or instance:IsA("TextButton")
-    end
-
-    local function Handle(label)
-        local text = label.Text
-        local record = rewritten[label]
-        local want = nameMap[text]
-        if want and not (record and record.Expected == text) then
-            rewritten[label] = { Expected = want, Original = text }
-            label.Text = want
-        elseif record and record.Expected ~= text then
-            rewritten[label] = nil
-        end
-    end
-
-    local function Hook(label)
-        if hooks[label] then return end
-        hooks[label] = label:GetPropertyChangedSignal("Text"):Connect(function() Handle(label) end)
-        Handle(label)
-    end
-
-    local function StopWatching()
-        hookToken = hookToken + 1
-        if addedConnection then
-            addedConnection:Disconnect()
-            addedConnection = nil
-        end
-        for label, connection in pairs(hooks) do
-            connection:Disconnect()
-            hooks[label] = nil
-        end
-    end
-
-    -- Hooks every label that exists now (in small batches so the frame never hitches) and every label added later.
-    local function StartWatching()
-        if addedConnection then return end
-        local gui = PlayerGui()
-        if not gui then return end
-        hookToken = hookToken + 1
-        local mine = hookToken
-
-        addedConnection = gui.DescendantAdded:Connect(function(descendant)
-            if IsText(descendant) then Hook(descendant) end
-        end)
-
-        task.spawn(function()
-            local list = gui:GetDescendants()
-            for index, instance in ipairs(list) do
-                if mine ~= hookToken then return end
-                if IsText(instance) then pcall(Hook, instance) end
-                if index % 300 == 0 then task.wait() end
-            end
-        end)
-    end
-
-    local function LinkNames(a, b)
-        local appearanceA, appearanceB = Appearance(a), Appearance(b)
-        if not (appearanceA and appearanceB) then return end
-        MapText(appearanceA.Name, appearanceB.Name, true)
-        MapText(appearanceB.Name, appearanceA.Name, true)
-        MapText(appearanceA.Desc, appearanceB.Desc, true)
-        MapText(appearanceB.Desc, appearanceA.Desc, true)
-
-        -- labels that are already hooked and show one of the names
-        for label in pairs(hooks) do Handle(label) end
-        StartWatching()
-    end
-
-    local function UnlinkNames(a, b)
-        local appearanceA, appearanceB = Appearance(a), Appearance(b)
-        if not (appearanceA and appearanceB) then return end
-        MapText(appearanceA.Name, appearanceB.Name, false)
-        MapText(appearanceB.Name, appearanceA.Name, false)
-        MapText(appearanceA.Desc, appearanceB.Desc, false)
-        MapText(appearanceB.Desc, appearanceA.Desc, false)
-        -- labels we rewrote that are still showing our text go back to what the game wrote
-        for label, record in pairs(rewritten) do
-            if record.Expected == label.Text and nameMap[record.Original] == nil then
-                label.Text = record.Original
-                rewritten[label] = nil
-            end
-        end
-        if next(nameMap) == nil then StopWatching() end
-    end
-
     function Swap.Swap(base, target)
         if Swap.GetState(base, target) ~= 2 then
             return false, "Please make sure you picked a valid Base and Target " .. NOUN .. "."
@@ -1228,7 +1105,6 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The swap failed: " .. tostring(err) end
 
-        pcall(LinkNames, base, target)
         swapped[base.Instance] = target.Instance
         swapped[target.Instance] = base.Instance
         return true, base.Display .. " ⇌ " .. target.Display
@@ -1245,7 +1121,6 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The revert failed: " .. tostring(err) end
 
-        pcall(UnlinkNames, base, target)
         swapped[base.Instance] = nil
         swapped[target.Instance] = nil
         return true, base.Display .. " and " .. target.Display .. " were restored."
