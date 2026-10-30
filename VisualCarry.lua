@@ -1,13 +1,22 @@
 -- Visual Carry (standalone) - by Honami
 -- UI is built in this file (styled after Mugiwara UI); swap and preview logic ported from Mugiwara HUB's
--- Games/Evade/VisualSwap.lua, CarryPreview.lua (Carry) and VisualGridUI.lua.
+-- Games/Evade/VisualSwap.lua, EmotePreview.lua (Carry) and VisualGridUI.lua. Runs together with Visual Emotes
+-- and Visual Unusual in one shared window when they are executed too (see "Shared shell").
+
+local SCRIPT_NAME = "Visual Carry"
+
+-- ==========================================================
+-- Shared shell (identical in Visual Emotes, Visual Carry and Visual Unusual)
+-- A script adds its own page to the shell. If another Visual script is already running, the page joins
+-- the same window (sidebar with one tab per script, like the hub); alone, a script gets the plain window.
+-- ==========================================================
 
 -- Only runs in Evade (same place ids as Mugiwara HUB); in any other game nothing is loaded.
 local EVADE_PLACE_IDS = { [9872472334] = true, [99214917572799] = true, [10668472534] = true }
 if not EVADE_PLACE_IDS[game.PlaceId] then
-    warn("[Visual Carry] This script only works in Evade.")
+    warn("[" .. SCRIPT_NAME .. "] This script only works in Evade.")
     pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Visual Carry", Text = "This script only works in Evade.", Duration = 6 })
+        game:GetService("StarterGui"):SetCore("SendNotification", { Title = SCRIPT_NAME, Text = "This script only works in Evade.", Duration = 6 })
     end)
     return
 end
@@ -16,25 +25,902 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
+local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
+
+-- Mugiwara UI, Gear 5 theme
+local THEME = {
+    Background = rgb(12, 13, 21), BackgroundAlpha = 0.12,
+    Sidebar = rgb(0, 0, 0), SidebarAlpha = 0.5,
+    Card = rgb(255, 255, 255), CardAlpha = 0.91,
+    Stroke = rgb(255, 255, 255), StrokeAlpha = 0.84,
+    Field = rgb(0, 0, 0), FieldAlpha = 0.45,
+    Popup = rgb(14, 14, 20), PopupAlpha = 0.08,
+    Text = rgb(252, 252, 255), SubText = rgb(200, 204, 220), Muted = rgb(142, 146, 164),
+    Accent = rgb(255, 255, 255), OnAccent = rgb(16, 18, 30),
+    Success = rgb(80, 230, 150), Danger = rgb(255, 72, 92),
+    Swapped = rgb(255, 200, 62),
+}
+local GRADIENT_STOPS = { rgb(255, 255, 255), rgb(224, 234, 255), rgb(255, 247, 226), rgb(255, 224, 160) }
+
+local function Linear(stops)
+    local points = {}
+    for index, color in ipairs(stops) do
+        points[index] = ColorSequenceKeypoint.new((index - 1) / (#stops - 1), color)
+    end
+    return ColorSequence.new(points)
+end
+local GRADIENT = Linear(GRADIENT_STOPS)
+local CYCLE = (function()
+    local mirrored = table.clone(GRADIENT_STOPS)
+    for index = #GRADIENT_STOPS - 1, 1, -1 do table.insert(mirrored, GRADIENT_STOPS[index]) end
+    return Linear(mirrored)
+end)()
+
+local FONT_TITLE, FONT_LABEL, FONT_BODY = Enum.Font.GothamBold, Enum.Font.GothamSemibold, Enum.Font.GothamMedium
+
+local function New(class, props, parent)
+    local instance = Instance.new(class)
+    for key, value in pairs(props) do instance[key] = value end
+    instance.Parent = parent
+    return instance
+end
+
+local function Round(instance, radius)
+    return New("UICorner", { CornerRadius = UDim.new(0, radius) }, instance)
+end
+
+local function Stroke(instance, transparency, thickness, color)
+    return New("UIStroke", {
+        Color = color or THEME.Stroke,
+        Transparency = transparency,
+        Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, instance)
+end
+
+local function Gradient(parent, rotation, sequence)
+    return New("UIGradient", { Rotation = rotation or 0, Color = sequence or GRADIENT }, parent)
+end
+
+local function Label(parent, props)
+    local merged = {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Font = FONT_BODY,
+        TextColor3 = THEME.Text,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }
+    for key, value in pairs(props) do merged[key] = value end
+    return New("TextLabel", merged, parent)
+end
+
+local function Tween(instance, props, duration, style)
+    TweenService:Create(instance, TweenInfo.new(duration or 0.2, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+-- Icons drawn from rotated bars, like Mugiwara UI draws its own glyphs.
+local function Glyph(parent, size)
+    return New("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(size, size),
+        BackgroundTransparency = 1,
+    }, parent)
+end
+
+local function Bar(root, length, thickness, rotation, x, y, color)
+    local bar = New("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(x, y),
+        Size = UDim2.fromOffset(length, thickness),
+        Rotation = rotation,
+        BackgroundColor3 = color,
+        BorderSizePixel = 0,
+    }, root)
+    Round(bar, thickness)
+    return bar
+end
+
+local function ChevronGlyph(parent, size, color)
+    local root = Glyph(parent, size)
+    local length = size * 0.56
+    return root, { Bar(root, length, 2, 45, 0.31, 0.5, color), Bar(root, length, 2, -45, 0.69, 0.5, color) }
+end
+
+local function CheckGlyph(parent, size, color)
+    local root = Glyph(parent, size)
+    Bar(root, size * 0.34, 2, 42, 0.3, 0.63, color)
+    Bar(root, size * 0.64, 2, -48, 0.63, 0.51, color)
+    return root
+end
+
+local function CloseGlyph(parent, size, color)
+    local root = Glyph(parent, size)
+    return { Bar(root, size * 0.78, 2, 45, 0.5, 0.5, color), Bar(root, size * 0.78, 2, -45, 0.5, 0.5, color) }
+end
+
+local function MinusGlyph(parent, size, color)
+    local root = Glyph(parent, size)
+    return { Bar(root, size * 0.7, 2, 0, 0.5, 0.5, color) }
+end
+
+-- A pill button: gradient fill (primary) or a white translucent card (secondary).
+local function MakeButton(parent, text, primary, width)
+    local pill = New("Frame", {
+        Size = UDim2.fromOffset(width, 32),
+        BackgroundColor3 = primary and Color3.new(1, 1, 1) or THEME.Card,
+        BackgroundTransparency = primary and 0 or THEME.CardAlpha,
+        BorderSizePixel = 0,
+    }, parent)
+    Round(pill, 9)
+    if primary then Gradient(pill, 0) else Stroke(pill, THEME.StrokeAlpha) end
+    local label = Label(pill, {
+        Text = text,
+        Font = FONT_TITLE,
+        TextColor3 = primary and THEME.OnAccent or THEME.Text,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.fromScale(1, 1),
+    })
+    local hit = New("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 3 }, pill)
+    local button = { Frame = pill, Label = label, Hit = hit, Primary = primary, Width = width }
+    hit.MouseButton1Down:Connect(function()
+        Tween(pill, { Size = UDim2.fromOffset(width - 6, 28) }, 0.08)
+    end)
+    hit.MouseButton1Up:Connect(function()
+        Tween(pill, { Size = UDim2.fromOffset(width, 32) }, 0.3, Enum.EasingStyle.Back)
+    end)
+    hit.MouseLeave:Connect(function()
+        Tween(pill, { Size = UDim2.fromOffset(width, 32) }, 0.2)
+    end)
+    if not primary then
+        hit.MouseEnter:Connect(function() Tween(pill, { BackgroundTransparency = 0.84 }, 0.15) end)
+        hit.MouseLeave:Connect(function() Tween(pill, { BackgroundTransparency = THEME.CardAlpha }, 0.2) end)
+    end
+    return button
+end
+
+local function SetEnabled(button, enabled)
+    button.Frame.BackgroundTransparency = enabled and (button.Primary and 0 or THEME.CardAlpha) or 0.6
+    button.Label.TextTransparency = enabled and 0 or 0.45
+end
+
+-- The usual page layout: a row of panes (PaneHolder) above a bottom bar with a status line.
+-- The script adds its own buttons to the bottom bar.
+local BAR_H = 56
+local function BuildPageLayout(frame)
+    local paneHolder = New("Frame", { Name = "Panes", Size = UDim2.new(1, 0, 1, -BAR_H), BackgroundTransparency = 1 }, frame)
+    New("UIPadding", {
+        PaddingTop = UDim.new(0, 12), PaddingLeft = UDim.new(0, 12),
+        PaddingRight = UDim.new(0, 12), PaddingBottom = UDim.new(0, 8),
+    }, paneHolder)
+    New("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 10),
+    }, paneHolder)
+
+    local bottomBar = New("Frame", {
+        Name = "BottomBar",
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.fromScale(0, 1),
+        Size = UDim2.new(1, 0, 0, BAR_H),
+        BackgroundTransparency = 1,
+    }, frame)
+    New("Frame", {
+        Size = UDim2.new(1, 0, 0, 1),
+        BackgroundColor3 = THEME.Stroke,
+        BackgroundTransparency = THEME.StrokeAlpha,
+        BorderSizePixel = 0,
+    }, bottomBar)
+
+    local statusLabel = Label(bottomBar, {
+        Position = UDim2.fromOffset(16, 0),
+        Size = UDim2.new(1, -290, 1, 0),
+        TextColor3 = THEME.SubText,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    return { PaneHolder = paneHolder, BottomBar = bottomBar, StatusLabel = statusLabel }
+end
+
+-- ----------------------------------------------------------
+-- The shell itself
+-- ----------------------------------------------------------
+local TOPBAR, SIDEBAR = 54, 150
+local MIN_WIDTH, MIN_HEIGHT, MAX_WIDTH, MAX_HEIGHT = 340, 340, 1200, 760
+
+local function CreateShell()
+    local Shell = { ApiVersion = 1, Alive = true, Pages = {}, Active = nil }
+    local connections, tweens = {}, {}
+    local opened = true
+
+    local function Spin(gradient, seconds)
+        local tween = TweenService:Create(gradient, TweenInfo.new(seconds, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), { Rotation = gradient.Rotation + 360 })
+        tween:Play()
+        table.insert(tweens, tween)
+    end
+
+    local guiParent
+    pcall(function() guiParent = (gethui and gethui()) or game:GetService("CoreGui") end)
+    if not guiParent then guiParent = Players.LocalPlayer:WaitForChild("PlayerGui") end
+
+    local Gui = New("ScreenGui", {
+        Name = "VisualSuite",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = 10000,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    }, guiParent)
+    Shell.Gui = Gui
+
+    local Main = New("Frame", {
+        Name = "Main",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(680, 470),
+        BackgroundTransparency = 1,
+    }, Gui)
+    local MainScale = New("UIScale", { Scale = 1 }, Main)
+
+    local Pop = New("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+    }, Main)
+    local PopScale = New("UIScale", { Scale = 0.9 }, Pop)
+
+    -- neon glow rings behind the window
+    local glowRings = {}
+    for _, layer in ipairs({ { 0, 3, 0.5 }, { 3, 7, 0.8 }, { 10, 14, 0.92 } }) do
+        local pad, thickness, transparency = layer[1], layer[2], layer[3]
+        local ring = New("Frame", {
+            Name = "Glow",
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.new(1, pad * 2, 1, pad * 2),
+            BackgroundTransparency = 1,
+        }, Pop)
+        Round(ring, 16 + pad)
+        local stroke = Stroke(ring, 1, thickness)
+        Spin(Gradient(stroke, 0, CYCLE), 9)
+        table.insert(glowRings, { Stroke = stroke, Base = transparency })
+    end
+
+    local Win = New("CanvasGroup", {
+        Name = "Window",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = THEME.Background,
+        BackgroundTransparency = THEME.BackgroundAlpha,
+        GroupTransparency = 1,
+        BorderSizePixel = 0,
+    }, Pop)
+    Round(Win, 16)
+
+    -- glass wash + sheen
+    local wash = New("Frame", { Name = "Wash", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, Win)
+    Gradient(wash, 35).Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.86), NumberSequenceKeypoint.new(0.5, 1), NumberSequenceKeypoint.new(1, 0.9),
+    })
+    local sheen = New("Frame", { Name = "Sheen", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, Win)
+    New("UIGradient", {
+        Rotation = 20,
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.92), NumberSequenceKeypoint.new(0.35, 1), NumberSequenceKeypoint.new(1, 0.97),
+        }),
+    }, sheen)
+
+    -- spinning neon border above the window
+    local border = New("Frame", { Name = "Border", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 5 }, Pop)
+    Round(border, 16)
+    local borderStroke = Stroke(border, 1, 1.5)
+    Spin(Gradient(borderStroke, 0, CYCLE), 9)
+    table.insert(glowRings, { Stroke = borderStroke, Base = 0.3 })
+
+    -- topbar
+    local TopBar = New("Frame", { Name = "Topbar", Size = UDim2.new(1, 0, 0, TOPBAR), BackgroundTransparency = 1 }, Win)
+
+    local brand = New("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 16, 0.5, 0),
+        Size = UDim2.fromOffset(30, 30),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, TopBar)
+    Round(brand, 9)
+    Gradient(brand, 45)
+    Label(brand, {
+        Text = "V",
+        Font = Enum.Font.GothamBlack,
+        TextSize = 17,
+        TextColor3 = THEME.OnAccent,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.fromScale(1, 1),
+    })
+
+    local titleRow = New("Frame", {
+        Position = UDim2.fromOffset(56, 8),
+        Size = UDim2.new(1, -200, 0, 22),
+        BackgroundTransparency = 1,
+    }, TopBar)
+    New("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Padding = UDim.new(0, 8),
+    }, titleRow)
+    local titleLabel = Label(titleRow, {
+        Text = "Visual",
+        Font = FONT_TITLE,
+        TextSize = 16,
+        TextColor3 = Color3.new(1, 1, 1),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Size = UDim2.fromOffset(0, 20),
+        LayoutOrder = 1,
+    })
+    Gradient(titleLabel, 0)
+
+    local versionPill = New("Frame", {
+        Size = UDim2.fromOffset(0, 16),
+        AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        LayoutOrder = 2,
+    }, titleRow)
+    Round(versionPill, 8)
+    New("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, versionPill)
+    Gradient(versionPill, 0)
+    local versionLabel = Label(versionPill, {
+        Text = "v2.0",
+        Font = FONT_TITLE,
+        TextSize = 11,
+        TextColor3 = THEME.OnAccent,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        AutomaticSize = Enum.AutomaticSize.X,
+        Size = UDim2.fromOffset(0, 16),
+    })
+
+    Label(TopBar, {
+        Text = "by Honami  ·  K to hide or show",
+        TextSize = 12,
+        TextColor3 = THEME.SubText,
+        Position = UDim2.fromOffset(56, 30),
+        Size = UDim2.new(1, -200, 0, 14),
+    })
+
+    local function ControlButton(offset, makeGlyph, hoverColor)
+        local button = New("TextButton", {
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BackgroundTransparency = 1,
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, offset, 0.5, 0),
+            Size = UDim2.fromOffset(34, 34),
+        }, TopBar)
+        Round(button, 9)
+        local bars = makeGlyph(button, 20, THEME.SubText)
+        button.MouseEnter:Connect(function()
+            Tween(button, { BackgroundTransparency = 0.88 }, 0.15)
+            for _, bar in ipairs(bars) do Tween(bar, { BackgroundColor3 = hoverColor or THEME.Text }, 0.15) end
+        end)
+        button.MouseLeave:Connect(function()
+            Tween(button, { BackgroundTransparency = 1 }, 0.2)
+            for _, bar in ipairs(bars) do Tween(bar, { BackgroundColor3 = THEME.SubText }, 0.2) end
+        end)
+        return button
+    end
+
+    local CloseButton = ControlButton(-12, CloseGlyph, THEME.Danger)
+    local MinimizeButton = ControlButton(-50, MinusGlyph)
+
+    local topLine = New("Frame", {
+        Position = UDim2.fromOffset(0, TOPBAR),
+        Size = UDim2.new(1, 0, 0, 1),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, Win)
+    Gradient(topLine, 0).Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.9), NumberSequenceKeypoint.new(0.5, 0.6), NumberSequenceKeypoint.new(1, 0.9),
+    })
+
+    local Body = New("Frame", {
+        Name = "Body",
+        Position = UDim2.fromOffset(0, TOPBAR + 1),
+        Size = UDim2.new(1, 0, 1, -(TOPBAR + 1)),
+        BackgroundTransparency = 1,
+    }, Win)
+
+    -- sidebar (only shown when two or more scripts share the window)
+    local Sidebar = New("Frame", {
+        Name = "Sidebar",
+        Size = UDim2.new(0, SIDEBAR, 1, 0),
+        BackgroundColor3 = THEME.Sidebar,
+        BackgroundTransparency = THEME.SidebarAlpha,
+        BorderSizePixel = 0,
+        Visible = false,
+    }, Body)
+    New("Frame", {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.fromScale(1, 0),
+        Size = UDim2.new(0, 1, 1, 0),
+        BackgroundColor3 = THEME.Stroke,
+        BackgroundTransparency = THEME.StrokeAlpha,
+        BorderSizePixel = 0,
+    }, Sidebar)
+    local TabList = New("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1 }, Sidebar)
+    New("UIPadding", {
+        PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10),
+        PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 9),
+    }, TabList)
+    New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, TabList)
+
+    local PageArea = New("Frame", { Name = "Pages", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1 }, Body)
+
+    -- ---------- layout ----------
+    local function ViewportSize()
+        local camera = workspace.CurrentCamera
+        return camera and camera.ViewportSize or Vector2.new(1280, 720)
+    end
+
+    local function PaintTab(page)
+        local tab = page.Tab
+        if not tab then return end
+        local on = Shell.Active == page
+        tab.Button.BackgroundTransparency = on and 0.78 or 1
+        tab.Stroke.Color = on and THEME.Accent or THEME.Stroke
+        tab.Stroke.Transparency = on and 0.45 or THEME.StrokeAlpha
+        tab.Label.TextColor3 = on and THEME.Text or THEME.SubText
+    end
+
+    local function MakeTab(page)
+        local button = New("TextButton", {
+            Name = page.Id,
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BackgroundTransparency = 1,
+            LayoutOrder = page.Order,
+            Size = UDim2.new(1, 0, 0, 38),
+        }, TabList)
+        Round(button, 10)
+        Gradient(button, 0)
+        local stroke = Stroke(button, THEME.StrokeAlpha)
+
+        local badge = New("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 8, 0.5, 0),
+            Size = UDim2.fromOffset(22, 22),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, button)
+        Round(badge, 7)
+        Gradient(badge, 45)
+        Label(badge, {
+            Text = page.Letter,
+            Font = Enum.Font.GothamBlack,
+            TextSize = 13,
+            TextColor3 = THEME.OnAccent,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            Size = UDim2.fromScale(1, 1),
+        })
+        local label = Label(button, {
+            Text = page.TabTitle,
+            Font = FONT_LABEL,
+            Position = UDim2.fromOffset(38, 0),
+            Size = UDim2.new(1, -44, 1, 0),
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+
+        page.Tab = { Button = button, Stroke = stroke, Label = label }
+        button.MouseEnter:Connect(function()
+            if Shell.Active ~= page then Tween(button, { BackgroundTransparency = 0.92 }, 0.12) end
+        end)
+        button.MouseLeave:Connect(function()
+            if Shell.Active ~= page then Tween(button, { BackgroundTransparency = 1 }, 0.15) end
+        end)
+        button.MouseButton1Click:Connect(function() Shell:SelectPage(page) end)
+    end
+
+    function Shell:SelectPage(page)
+        self.Active = page
+        for _, other in ipairs(self.Pages) do
+            other.Frame.Visible = other == page
+            PaintTab(other)
+        end
+        if page.OnShow then task.defer(page.OnShow) end
+    end
+
+    local function Relayout()
+        local count = #Shell.Pages
+        if count == 0 then return end
+        local combined = count >= 2
+
+        Sidebar.Visible = combined
+        PageArea.Position = UDim2.fromOffset(combined and SIDEBAR or 0, 0)
+        PageArea.Size = UDim2.new(1, combined and -SIDEBAR or 0, 1, 0)
+
+        local width, height = MIN_WIDTH, MIN_HEIGHT
+        for _, page in ipairs(Shell.Pages) do
+            width = math.max(width, page.Width)
+            height = math.max(height, page.Height)
+            if combined and not page.Tab then MakeTab(page) end
+            if not combined and page.Tab then
+                page.Tab.Button:Destroy()
+                page.Tab = nil
+            end
+        end
+        width = width + (combined and SIDEBAR or 0)
+
+        if combined then
+            titleLabel.Text = "Visual Suite"
+        else
+            titleLabel.Text = Shell.Pages[1].Title
+        end
+
+        -- small screens (phones) shrink the whole window so it fits
+        local screen = ViewportSize()
+        local scale = math.clamp(math.min(1, (screen.X - 24) / width, (screen.Y - 24) / height), 0.45, 1)
+        MainScale.Scale = scale
+        Tween(Main, { Size = UDim2.fromOffset(width, height) }, 0.3, Enum.EasingStyle.Quint)
+
+        for _, page in ipairs(Shell.Pages) do PaintTab(page) end
+    end
+
+    -- A script adds its page here. spec: Id, Title (window title when alone), TabTitle, Letter, Order,
+    -- Width, Height (preferred size of its content), Cleanup (called when the window is closed), OnShow.
+    function Shell:AddPage(spec)
+        local page = {
+            Id = spec.Id,
+            Title = spec.Title,
+            TabTitle = spec.TabTitle or spec.Title,
+            Letter = spec.Letter or string.sub(spec.Title, 1, 1),
+            Order = spec.Order or 99,
+            Width = spec.Width or 680,
+            Height = spec.Height or 470,
+            Cleanup = spec.Cleanup,
+            OnShow = spec.OnShow,
+        }
+        page.Frame = New("Frame", { Name = page.Id, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false }, PageArea)
+
+        table.insert(self.Pages, page)
+        table.sort(self.Pages, function(a, b) return a.Order < b.Order end)
+        Relayout()
+        self:SelectPage(page)
+        if not opened then self:SetOpen(true) end
+        return page
+    end
+
+    function Shell:RemovePage(id)
+        for index, page in ipairs(self.Pages) do
+            if page.Id == id then
+                table.remove(self.Pages, index)
+                if page.Tab then page.Tab.Button:Destroy() end
+                page.Frame:Destroy()
+                if self.Active == page then self.Active = nil end
+                break
+            end
+        end
+        if #self.Pages == 0 then
+            self:Destroy()
+            return
+        end
+        Relayout()
+        if not self.Active then self:SelectPage(self.Pages[1]) end
+    end
+
+    function Shell:Destroy()
+        if not self.Alive then return end
+        self.Alive = false
+        for _, tween in ipairs(tweens) do pcall(function() tween:Cancel() end) end
+        for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+        pcall(function() Gui:Destroy() end)
+        if getgenv().VisualSuiteShell == self then getgenv().VisualSuiteShell = nil end
+    end
+
+    -- Every page puts its swaps / effects back, then the window goes away.
+    function Shell:CloseAll()
+        for _, page in ipairs(table.clone(self.Pages)) do
+            if page.Cleanup then pcall(page.Cleanup) end
+        end
+        self:Destroy()
+    end
+
+    -- ---------- drag, resize ----------
+    local dragging, dragStart, startPosition = false, nil, nil
+    TopBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPosition = true, input.Position, Main.Position
+        end
+    end)
+
+    local grip = New("TextButton", {
+        Name = "ResizeGrip",
+        Text = "",
+        AutoButtonColor = false,
+        BackgroundTransparency = 1,
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -4, 1, -4),
+        Size = UDim2.fromOffset(22, 22),
+        ZIndex = 8,
+    }, Pop)
+    Bar(grip, 14, 2, -45, 0.58, 0.58, THEME.Muted)
+    Bar(grip, 7, 2, -45, 0.78, 0.78, THEME.Muted)
+
+    local resizing, resizeStart, startSize, resizeOrigin = false, nil, nil, nil
+    grip.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            resizing, resizeStart, startSize, resizeOrigin = true, input.Position, Main.Size, Main.Position
+        end
+    end)
+
+    -- Mouse buttons reuse one InputObject, so releases are caught once, here, instead of connecting
+    -- to every press (those connections would pile up and fire on every later release).
+    local pressed, moved, pressStart, pressPosition = false, false, nil, nil
+
+    table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+        local isMove = input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch
+        if not isMove then return end
+        local scale = MainScale.Scale
+
+        if dragging then
+            local delta = (input.Position - dragStart) / scale
+            Main.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+        end
+
+        if resizing then
+            local screen = ViewportSize()
+            local delta = (input.Position - resizeStart) / scale
+            local maxWidth = math.max(MIN_WIDTH, math.min(MAX_WIDTH, (screen.X - 24) / scale))
+            local maxHeight = math.max(MIN_HEIGHT, math.min(MAX_HEIGHT, (screen.Y - 24) / scale))
+            local width = math.clamp(startSize.X.Offset + delta.X, MIN_WIDTH, maxWidth)
+            local height = math.clamp(startSize.Y.Offset + delta.Y, MIN_HEIGHT, maxHeight)
+            Main.Size = UDim2.fromOffset(width, height)
+            Main.Position = UDim2.new(
+                resizeOrigin.X.Scale, resizeOrigin.X.Offset + (width - startSize.X.Offset) / 2,
+                resizeOrigin.Y.Scale, resizeOrigin.Y.Offset + (height - startSize.Y.Offset) / 2
+            )
+        end
+
+        if pressed then
+            local delta = (input.Position - pressStart) / scale
+            if delta.Magnitude * scale > 6 then moved = true end
+            if moved then
+                Shell.OpenButton.Position = UDim2.new(pressPosition.X.Scale, pressPosition.X.Offset + delta.X, pressPosition.Y.Scale, pressPosition.Y.Offset + delta.Y)
+            end
+        end
+    end))
+
+    -- ---------- minimize / open button ----------
+    local OpenButton = New("TextButton", {
+        Name = "OpenButton",
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 36, 0.5, 0),
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundColor3 = THEME.Popup,
+        BackgroundTransparency = THEME.PopupAlpha,
+        Visible = false,
+    }, Gui)
+    Shell.OpenButton = OpenButton
+    New("UICorner", { CornerRadius = UDim.new(1, 0) }, OpenButton)
+    local OpenScale = New("UIScale", { Scale = 1 }, OpenButton)
+    Spin(Gradient(Stroke(OpenButton, 0.15, 2), 0, CYCLE), 6)
+    Spin(Gradient(Stroke(OpenButton, 0.7, 6), 0, CYCLE), 6)
+    local openMark = Label(OpenButton, {
+        Text = "V",
+        Font = Enum.Font.GothamBlack,
+        TextSize = 22,
+        TextColor3 = Color3.new(1, 1, 1),
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.fromScale(1, 1),
+    })
+    Gradient(openMark, 45)
+
+    function Shell:SetOpen(state)
+        if state == opened or not self.Alive then return end
+        opened = state
+        OpenScale.Scale = MainScale.Scale
+        if state then
+            Main.Visible = true
+            PopScale.Scale = 0.9
+            Tween(PopScale, { Scale = 1 }, 0.5, Enum.EasingStyle.Quint)
+            Tween(Win, { GroupTransparency = 0 }, 0.3)
+            for _, ring in ipairs(glowRings) do Tween(ring.Stroke, { Transparency = ring.Base }, 0.4) end
+            Tween(OpenButton, { Size = UDim2.fromOffset(0, 0) }, 0.18)
+            task.delay(0.18, function()
+                if opened then OpenButton.Visible = false end
+            end)
+            if self.Active and self.Active.OnShow then task.defer(self.Active.OnShow) end
+        else
+            Tween(PopScale, { Scale = 0.92 }, 0.3, Enum.EasingStyle.Quint)
+            Tween(Win, { GroupTransparency = 1 }, 0.24)
+            for _, ring in ipairs(glowRings) do Tween(ring.Stroke, { Transparency = 1 }, 0.2) end
+            task.delay(0.3, function()
+                if not opened then Main.Visible = false end
+            end)
+            OpenButton.Visible = true
+            Tween(OpenButton, { Size = UDim2.fromOffset(52, 52) }, 0.5, Enum.EasingStyle.Back)
+        end
+    end
+
+    OpenButton.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            pressed, moved, pressStart, pressPosition = true, false, input.Position, OpenButton.Position
+        end
+    end)
+
+    table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        dragging, resizing = false, false
+        if pressed then
+            pressed = false
+            -- a tap (no drag) on the open button opens the window again
+            if not moved then Shell:SetOpen(true) end
+        end
+    end))
+
+    MinimizeButton.MouseButton1Click:Connect(function() Shell:SetOpen(false) end)
+
+    table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
+        if processed or UserInputService:GetFocusedTextBox() then return end
+        if input.KeyCode == Enum.KeyCode.K then Shell:SetOpen(not opened) end
+    end))
+
+    -- ---------- close confirmation ----------
+    local dialogOpen = false
+    local function ConfirmClose()
+        if dialogOpen then return end
+        dialogOpen = true
+
+        local overlay = New("TextButton", {
+            Name = "Dialog",
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            Size = UDim2.fromScale(1, 1),
+            BackgroundColor3 = Color3.new(0, 0, 0),
+            BackgroundTransparency = 1,
+            ZIndex = 50,
+        }, Win)
+        Tween(overlay, { BackgroundTransparency = 0.42 }, 0.25)
+
+        local card = New("CanvasGroup", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.new(0, 330, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = THEME.Popup,
+            BackgroundTransparency = THEME.PopupAlpha,
+            GroupTransparency = 1,
+            BorderSizePixel = 0,
+            Active = true,
+            ZIndex = 51,
+        }, overlay)
+        Round(card, 14)
+        local outline = Stroke(card, 1, 1.4, Color3.new(1, 1, 1))
+        Spin(Gradient(outline, 45, CYCLE), 8)
+        New("UIPadding", {
+            PaddingTop = UDim.new(0, 18), PaddingBottom = UDim.new(0, 18),
+            PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18),
+        }, card)
+        New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10) }, card)
+        local cardScale = New("UIScale", { Scale = 0.9 }, card)
+        Tween(cardScale, { Scale = 1 }, 0.4, Enum.EasingStyle.Quint)
+        Tween(card, { GroupTransparency = 0 }, 0.25)
+        Tween(outline, { Transparency = 0.3 }, 0.25)
+
+        local title = Label(card, {
+            Text = "Close " .. titleLabel.Text .. "?",
+            Font = FONT_TITLE,
+            TextSize = 16,
+            TextColor3 = Color3.new(1, 1, 1),
+            TextWrapped = true,
+            AutomaticSize = Enum.AutomaticSize.Y,
+            Size = UDim2.new(1, 0, 0, 0),
+            LayoutOrder = 1,
+        })
+        Gradient(title, 0)
+        Label(card, {
+            Text = "The interface will be closed and everything you swapped or applied will be put back to normal. Run the script again to reopen it.",
+            TextSize = 14,
+            TextColor3 = THEME.SubText,
+            TextWrapped = true,
+            AutomaticSize = Enum.AutomaticSize.Y,
+            Size = UDim2.new(1, 0, 0, 0),
+            LayoutOrder = 2,
+        })
+
+        local row = New("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1, LayoutOrder = 3 }, card)
+        New("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            HorizontalAlignment = Enum.HorizontalAlignment.Right,
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Padding = UDim.new(0, 8),
+        }, row)
+
+        local function CloseDialog()
+            Tween(cardScale, { Scale = 0.93 }, 0.2)
+            Tween(card, { GroupTransparency = 1 }, 0.2)
+            Tween(outline, { Transparency = 1 }, 0.2)
+            Tween(overlay, { BackgroundTransparency = 1 }, 0.2)
+            task.delay(0.22, function()
+                overlay:Destroy()
+                dialogOpen = false
+            end)
+        end
+
+        local function DialogButton(text, danger, order, callback)
+            local button = New("TextButton", {
+                Text = text,
+                Font = FONT_TITLE,
+                TextSize = 13,
+                TextColor3 = danger and THEME.OnAccent or THEME.Text,
+                AutoButtonColor = false,
+                BorderSizePixel = 0,
+                AutomaticSize = Enum.AutomaticSize.X,
+                Size = UDim2.fromOffset(0, 36),
+                BackgroundColor3 = danger and THEME.Danger or THEME.Card,
+                BackgroundTransparency = danger and 0 or 0.84,
+                LayoutOrder = order,
+            }, row)
+            Round(button, 9)
+            New("UIPadding", { PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18) }, button)
+            button.MouseButton1Click:Connect(callback)
+        end
+
+        DialogButton("Cancel", false, 1, CloseDialog)
+        DialogButton("Close", true, 2, function() Shell:CloseAll() end)
+    end
+    CloseButton.MouseButton1Click:Connect(ConfirmClose)
+
+    -- open animation: pop in and fade the glow up
+    Tween(PopScale, { Scale = 1 }, 0.45, Enum.EasingStyle.Back)
+    Tween(Win, { GroupTransparency = 0 }, 0.35)
+    for _, ring in ipairs(glowRings) do Tween(ring.Stroke, { Transparency = ring.Base }, 0.45) end
+
+    return Shell
+end
+
+-- The shell shared by every Visual script that is running; the first one to start creates it.
+local function GetShell()
+    local existing = getgenv().VisualSuiteShell
+    if existing and existing.Alive and existing.Gui and existing.Gui.Parent then return existing end
+    local shell = CreateShell()
+    getgenv().VisualSuiteShell = shell
+    return shell
+end
+
+
+-- ==========================================================
+-- This script
+-- ==========================================================
 local FOLDER = "VisualCarry"
 if makefolder and isfolder and not isfolder(FOLDER) then makefolder(FOLDER) end
 
--- VisualSwap/CarryPreview below call getgenv().MugiwaraRegisterCleanup(...) and read
--- getgenv().MugiwaraFolder - satisfied here with a small local implementation (no hub loaded).
 local cleanupFns = {}
 local function RegisterCleanup(fn)
     table.insert(cleanupFns, fn)
 end
-getgenv().MugiwaraFolder = FOLDER
-getgenv().MugiwaraRegisterCleanup = RegisterCleanup
 
--- Dijalankan saat script dimuat ulang: hasil swap dari sesi sebelumnya dikembalikan dulu.
+local Shell, Page
+local function ModuleCleanup()
+    local fns = cleanupFns
+    cleanupFns = {}
+    for _, fn in ipairs(fns) do pcall(fn) end
+    if Shell and Page then Shell:RemovePage(Page.Id) end
+end
+
+-- Run again while an older copy is still open: that copy puts everything back first.
 local env = getgenv()
 if env.VisualCarryCleanup then pcall(env.VisualCarryCleanup) end
-env.VisualCarryCleanup = function()
-    for _, fn in ipairs(cleanupFns) do pcall(fn) end
-end
+env.VisualCarryCleanup = ModuleCleanup
 
 -- ==========================================================
 -- Swap engine (ported from Games/Evade/VisualSwap.lua)
@@ -255,7 +1141,7 @@ local function NewSwap(config)
         return restored, touched
     end
 
-    getgenv().MugiwaraRegisterCleanup(function()
+    RegisterCleanup(function()
         pcall(Swap.RevertAll)
     end)
 
@@ -814,681 +1700,29 @@ do
     end)
 end
 
+
 -- ==========================================================
--- UI: own implementation that copies the look of Mugiwara UI (Gear 5 theme): glass window,
--- spinning neon border, animated gradient title / badge / buttons, white translucent cards,
--- dark inset fields and picture cells with a check badge. Layout: Base left, Target right, each
--- with a category dropdown, a search box and an always-open grid of previews.
+-- Page in the shared window
 -- ==========================================================
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-
-local VERSION = "v2.0"
-
-local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
-
-local THEME = {
-    Background = rgb(12, 13, 21), BackgroundAlpha = 0.12,
-    Card = rgb(255, 255, 255), CardAlpha = 0.91,
-    Stroke = rgb(255, 255, 255), StrokeAlpha = 0.84,
-    Field = rgb(0, 0, 0), FieldAlpha = 0.45,
-    Popup = rgb(14, 14, 20), PopupAlpha = 0.08,
-    Text = rgb(252, 252, 255), SubText = rgb(200, 204, 220), Muted = rgb(142, 146, 164),
-    Accent = rgb(255, 255, 255), OnAccent = rgb(16, 18, 30),
-    Success = rgb(80, 230, 150), Danger = rgb(255, 72, 92),
-    Swapped = rgb(255, 200, 62),
-}
-local GRADIENT_STOPS = { rgb(255, 255, 255), rgb(224, 234, 255), rgb(255, 247, 226), rgb(255, 224, 160) }
-
-local function Linear(stops)
-    local points = {}
-    for index, color in ipairs(stops) do
-        points[index] = ColorSequenceKeypoint.new((index - 1) / (#stops - 1), color)
-    end
-    return ColorSequence.new(points)
-end
-local GRADIENT = Linear(GRADIENT_STOPS)
-local CYCLE = (function()
-    local mirrored = table.clone(GRADIENT_STOPS)
-    for index = #GRADIENT_STOPS - 1, 1, -1 do table.insert(mirrored, GRADIENT_STOPS[index]) end
-    return Linear(mirrored)
-end)()
-
-local FONT_TITLE, FONT_LABEL, FONT_BODY = Enum.Font.GothamBold, Enum.Font.GothamSemibold, Enum.Font.GothamMedium
-
-local function New(class, props, parent)
-    local instance = Instance.new(class)
-    for key, value in pairs(props) do instance[key] = value end
-    instance.Parent = parent
-    return instance
-end
-
-local function Round(instance, radius)
-    return New("UICorner", { CornerRadius = UDim.new(0, radius) }, instance)
-end
-
-local function Stroke(instance, transparency, thickness, color)
-    return New("UIStroke", {
-        Color = color or THEME.Stroke,
-        Transparency = transparency,
-        Thickness = thickness or 1,
-        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-    }, instance)
-end
-
-local function Gradient(parent, rotation, sequence)
-    return New("UIGradient", { Rotation = rotation or 0, Color = sequence or GRADIENT }, parent)
-end
-
-local function Label(parent, props)
-    local merged = {
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        Font = FONT_BODY,
-        TextColor3 = THEME.Text,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }
-    for key, value in pairs(props) do merged[key] = value end
-    return New("TextLabel", merged, parent)
-end
-
-local function Tween(instance, props, duration, style)
-    TweenService:Create(instance, TweenInfo.new(duration or 0.2, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
-end
-
-local spinTweens = {}
-local function Spin(gradient, seconds)
-    local tween = TweenService:Create(gradient, TweenInfo.new(seconds, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), { Rotation = gradient.Rotation + 360 })
-    tween:Play()
-    table.insert(spinTweens, tween)
-end
-RegisterCleanup(function()
-    for _, tween in ipairs(spinTweens) do pcall(function() tween:Cancel() end) end
-end)
-
--- Icons drawn from rotated bars, like Mugiwara UI draws its own glyphs.
-local function Glyph(parent, size)
-    return New("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromOffset(size, size),
-        BackgroundTransparency = 1,
-    }, parent)
-end
-
-local function Bar(root, length, thickness, rotation, x, y, color)
-    local bar = New("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.fromScale(x, y),
-        Size = UDim2.fromOffset(length, thickness),
-        Rotation = rotation,
-        BackgroundColor3 = color,
-        BorderSizePixel = 0,
-    }, root)
-    Round(bar, thickness)
-    return bar
-end
-
-local function ChevronGlyph(parent, size, color)
-    local root = Glyph(parent, size)
-    local length = size * 0.56
-    return root, { Bar(root, length, 2, 45, 0.31, 0.5, color), Bar(root, length, 2, -45, 0.69, 0.5, color) }
-end
-
-local function CheckGlyph(parent, size, color)
-    local root = Glyph(parent, size)
-    Bar(root, size * 0.34, 2, 42, 0.3, 0.63, color)
-    Bar(root, size * 0.64, 2, -48, 0.63, 0.51, color)
-    return root
-end
-
-local function CloseGlyph(parent, size, color)
-    local root = Glyph(parent, size)
-    return { Bar(root, size * 0.78, 2, 45, 0.5, 0.5, color), Bar(root, size * 0.78, 2, -45, 0.5, 0.5, color) }
-end
-
-local function MinusGlyph(parent, size, color)
-    local root = Glyph(parent, size)
-    return { Bar(root, size * 0.7, 2, 0, 0.5, 0.5, color) }
-end
-
--- A pill button: gradient fill (primary) or a white translucent card (secondary).
-local function MakeButton(parent, text, primary, width)
-    local pill = New("Frame", {
-        Size = UDim2.fromOffset(width, 32),
-        BackgroundColor3 = primary and Color3.new(1, 1, 1) or THEME.Card,
-        BackgroundTransparency = primary and 0 or THEME.CardAlpha,
-        BorderSizePixel = 0,
-    }, parent)
-    Round(pill, 9)
-    if primary then Gradient(pill, 0) else Stroke(pill, THEME.StrokeAlpha) end
-    local label = Label(pill, {
-        Text = text,
-        Font = FONT_TITLE,
-        TextColor3 = primary and THEME.OnAccent or THEME.Text,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        Size = UDim2.fromScale(1, 1),
-    })
-    local hit = New("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 3 }, pill)
-    local button = { Frame = pill, Label = label, Hit = hit, Primary = primary, Width = width }
-    hit.MouseButton1Down:Connect(function()
-        Tween(pill, { Size = UDim2.fromOffset(width - 6, 28) }, 0.08)
-    end)
-    hit.MouseButton1Up:Connect(function()
-        Tween(pill, { Size = UDim2.fromOffset(width, 32) }, 0.3, Enum.EasingStyle.Back)
-    end)
-    hit.MouseLeave:Connect(function()
-        Tween(pill, { Size = UDim2.fromOffset(width, 32) }, 0.2)
-    end)
-    if not primary then
-        hit.MouseEnter:Connect(function() Tween(pill, { BackgroundTransparency = 0.84 }, 0.15) end)
-        hit.MouseLeave:Connect(function() Tween(pill, { BackgroundTransparency = THEME.CardAlpha }, 0.2) end)
-    end
-    return button
-end
-
-local function SetEnabled(button, enabled)
-    button.Frame.BackgroundTransparency = enabled and (button.Primary and 0 or THEME.CardAlpha) or 0.6
-    button.Label.TextTransparency = enabled and 0 or 0.45
-end
-
-local guiParent
-pcall(function() guiParent = (gethui and gethui()) or game:GetService("CoreGui") end)
-if not guiParent then guiParent = Players.LocalPlayer:WaitForChild("PlayerGui") end
-
-local Gui = New("ScreenGui", {
-    Name = "VisualCarry",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    DisplayOrder = 10000,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, guiParent)
-RegisterCleanup(function() pcall(function() Gui:Destroy() end) end)
-
-local camera = workspace.CurrentCamera
-local screen = camera and camera.ViewportSize or Vector2.new(1280, 720)
-local WIDTH, HEIGHT = 680, 470
-local MIN_WIDTH, MIN_HEIGHT, MAX_WIDTH, MAX_HEIGHT = 480, 340, 1000, 760
-local TOPBAR, BAR_H = 54, 56
--- Small screens (phones) shrink the whole UI so it fits instead of being cut off.
-local UI_SCALE = math.clamp(math.min(1, (screen.X - 24) / WIDTH, (screen.Y - 24) / HEIGHT), 0.45, 1)
-
-local Main = New("Frame", {
-    Name = "Main",
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(WIDTH, HEIGHT),
-    BackgroundTransparency = 1,
-}, Gui)
-New("UIScale", { Scale = UI_SCALE }, Main)
-
-local Pop = New("Frame", {
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromScale(1, 1),
-    BackgroundTransparency = 1,
-}, Main)
-local PopScale = New("UIScale", { Scale = 0.9 }, Pop)
-
--- neon glow rings behind the window
-local glowRings = {}
-for _, layer in ipairs({ { 0, 3, 0.5 }, { 3, 7, 0.8 }, { 10, 14, 0.92 } }) do
-    local pad, thickness, transparency = layer[1], layer[2], layer[3]
-    local ring = New("Frame", {
-        Name = "Glow",
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.new(1, pad * 2, 1, pad * 2),
-        BackgroundTransparency = 1,
-    }, Pop)
-    Round(ring, 16 + pad)
-    local stroke = Stroke(ring, 1, thickness)
-    Spin(Gradient(stroke, 0, CYCLE), 9)
-    table.insert(glowRings, { Stroke = stroke, Base = transparency })
-end
-
-local Win = New("CanvasGroup", {
-    Name = "Window",
-    Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = THEME.Background,
-    BackgroundTransparency = THEME.BackgroundAlpha,
-    GroupTransparency = 1,
-    BorderSizePixel = 0,
-}, Pop)
-Round(Win, 16)
-
--- glass wash + sheen
-local wash = New("Frame", { Name = "Wash", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, Win)
-Gradient(wash, 35).Transparency = NumberSequence.new({
-    NumberSequenceKeypoint.new(0, 0.86), NumberSequenceKeypoint.new(0.5, 1), NumberSequenceKeypoint.new(1, 0.9),
+Shell = GetShell()
+Page = Shell:AddPage({
+    Id = "Carry",
+    Title = "Visual Carry",
+    TabTitle = "Carry",
+    Letter = "C",
+    Order = 2,
+    Width = 680,
+    Height = 470,
+    Cleanup = ModuleCleanup,
 })
-local sheen = New("Frame", { Name = "Sheen", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, Win)
-New("UIGradient", {
-    Rotation = 20,
-    Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.92), NumberSequenceKeypoint.new(0.35, 1), NumberSequenceKeypoint.new(1, 0.97),
-    }),
-}, sheen)
-
--- spinning neon border above the window
-local border = New("Frame", { Name = "Border", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 5 }, Pop)
-Round(border, 16)
-local borderStroke = Stroke(border, 1, 1.5)
-Spin(Gradient(borderStroke, 0, CYCLE), 9)
-table.insert(glowRings, { Stroke = borderStroke, Base = 0.3 })
-
--- topbar
-local TopBar = New("Frame", { Name = "Topbar", Size = UDim2.new(1, 0, 0, TOPBAR), BackgroundTransparency = 1 }, Win)
-
-local brand = New("Frame", {
-    AnchorPoint = Vector2.new(0, 0.5),
-    Position = UDim2.new(0, 16, 0.5, 0),
-    Size = UDim2.fromOffset(30, 30),
-    BackgroundColor3 = Color3.new(1, 1, 1),
-    BorderSizePixel = 0,
-}, TopBar)
-Round(brand, 9)
-Gradient(brand, 45)
-Label(brand, {
-    Text = "V",
-    Font = Enum.Font.GothamBlack,
-    TextSize = 17,
-    TextColor3 = THEME.OnAccent,
-    TextXAlignment = Enum.TextXAlignment.Center,
-    Size = UDim2.fromScale(1, 1),
-})
-
-local titleRow = New("Frame", {
-    Position = UDim2.fromOffset(56, 8),
-    Size = UDim2.new(1, -200, 0, 22),
-    BackgroundTransparency = 1,
-}, TopBar)
-New("UIListLayout", {
-    FillDirection = Enum.FillDirection.Horizontal,
-    VerticalAlignment = Enum.VerticalAlignment.Center,
-    Padding = UDim.new(0, 8),
-}, titleRow)
-local titleLabel = Label(titleRow, {
-    Text = "Visual Carry",
-    Font = FONT_TITLE,
-    TextSize = 16,
-    TextColor3 = Color3.new(1, 1, 1),
-    AutomaticSize = Enum.AutomaticSize.X,
-    Size = UDim2.fromOffset(0, 20),
-    LayoutOrder = 1,
-})
-Gradient(titleLabel, 0)
-
-local versionPill = New("Frame", {
-    Size = UDim2.fromOffset(0, 16),
-    AutomaticSize = Enum.AutomaticSize.X,
-    BackgroundColor3 = Color3.new(1, 1, 1),
-    BorderSizePixel = 0,
-    LayoutOrder = 2,
-}, titleRow)
-Round(versionPill, 8)
-New("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, versionPill)
-Gradient(versionPill, 0)
-Label(versionPill, {
-    Text = VERSION,
-    Font = FONT_TITLE,
-    TextSize = 11,
-    TextColor3 = THEME.OnAccent,
-    TextXAlignment = Enum.TextXAlignment.Center,
-    AutomaticSize = Enum.AutomaticSize.X,
-    Size = UDim2.fromOffset(0, 16),
-})
-
-Label(TopBar, {
-    Text = "by Honami  ·  K to hide or show",
-    TextSize = 12,
-    TextColor3 = THEME.SubText,
-    Position = UDim2.fromOffset(56, 30),
-    Size = UDim2.new(1, -200, 0, 14),
-})
-
-local function ControlButton(offset, makeGlyph, hoverColor)
-    local button = New("TextButton", {
-        Text = "",
-        AutoButtonColor = false,
-        BorderSizePixel = 0,
-        BackgroundColor3 = Color3.new(1, 1, 1),
-        BackgroundTransparency = 1,
-        AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, offset, 0.5, 0),
-        Size = UDim2.fromOffset(34, 34),
-    }, TopBar)
-    Round(button, 9)
-    local bars = makeGlyph(button, 20, THEME.SubText)
-    button.MouseEnter:Connect(function()
-        Tween(button, { BackgroundTransparency = 0.88 }, 0.15)
-        for _, bar in ipairs(bars) do Tween(bar, { BackgroundColor3 = hoverColor or THEME.Text }, 0.15) end
-    end)
-    button.MouseLeave:Connect(function()
-        Tween(button, { BackgroundTransparency = 1 }, 0.2)
-        for _, bar in ipairs(bars) do Tween(bar, { BackgroundColor3 = THEME.SubText }, 0.2) end
-    end)
-    return button
-end
-
-local CloseButton = ControlButton(-12, CloseGlyph, THEME.Danger)
-local MinimizeButton = ControlButton(-50, MinusGlyph)
-
-local topLine = New("Frame", {
-    Position = UDim2.fromOffset(0, TOPBAR),
-    Size = UDim2.new(1, 0, 0, 1),
-    BackgroundColor3 = Color3.new(1, 1, 1),
-    BorderSizePixel = 0,
-}, Win)
-Gradient(topLine, 0).Transparency = NumberSequence.new({
-    NumberSequenceKeypoint.new(0, 0.9), NumberSequenceKeypoint.new(0.5, 0.6), NumberSequenceKeypoint.new(1, 0.9),
-})
-
-local Body = New("Frame", {
-    Name = "Body",
-    Position = UDim2.fromOffset(0, TOPBAR + 1),
-    Size = UDim2.new(1, 0, 1, -(TOPBAR + 1)),
-    BackgroundTransparency = 1,
-}, Win)
-
-local PaneHolder = New("Frame", { Name = "Panes", Size = UDim2.new(1, 0, 1, -BAR_H), BackgroundTransparency = 1 }, Body)
-New("UIPadding", {
-    PaddingTop = UDim.new(0, 12), PaddingLeft = UDim.new(0, 12),
-    PaddingRight = UDim.new(0, 12), PaddingBottom = UDim.new(0, 8),
-}, PaneHolder)
-New("UIListLayout", {
-    FillDirection = Enum.FillDirection.Horizontal,
-    SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 10),
-}, PaneHolder)
-
-local BottomBar = New("Frame", {
-    Name = "BottomBar",
-    AnchorPoint = Vector2.new(0, 1),
-    Position = UDim2.fromScale(0, 1),
-    Size = UDim2.new(1, 0, 0, BAR_H),
-    BackgroundTransparency = 1,
-}, Body)
-New("Frame", {
-    Size = UDim2.new(1, 0, 0, 1),
-    BackgroundColor3 = THEME.Stroke,
-    BackgroundTransparency = THEME.StrokeAlpha,
-    BorderSizePixel = 0,
-}, BottomBar)
-
-local StatusLabel = Label(BottomBar, {
-    Position = UDim2.fromOffset(16, 0),
-    Size = UDim2.new(1, -290, 1, 0),
-    TextColor3 = THEME.SubText,
-    TextTruncate = Enum.TextTruncate.AtEnd,
-})
-local RevertAllButton = MakeButton(BottomBar, "Revert All", false, 104)
+local PageLayout = BuildPageLayout(Page.Frame)
+local PaneHolder, StatusLabel = PageLayout.PaneHolder, PageLayout.StatusLabel
+local RevertAllButton = MakeButton(PageLayout.BottomBar, "Revert All", false, 104)
 RevertAllButton.Frame.AnchorPoint = Vector2.new(1, 0.5)
 RevertAllButton.Frame.Position = UDim2.new(1, -12, 0.5, 0)
-local SwapButton = MakeButton(BottomBar, "Swap", true, 140)
+local SwapButton = MakeButton(PageLayout.BottomBar, "Swap", true, 140)
 SwapButton.Frame.AnchorPoint = Vector2.new(1, 0.5)
 SwapButton.Frame.Position = UDim2.new(1, -128, 0.5, 0)
-
--- Window behaviour: drag by the topbar, minimize, close.
-do
-    local dragging, dragStart, startPosition = false, nil, nil
-    TopBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging, dragStart, startPosition = true, input.Position, Main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    local moveConnection = UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = (input.Position - dragStart) / UI_SCALE
-            Main.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
-        end
-    end)
-    RegisterCleanup(function() moveConnection:Disconnect() end)
-
-    -- resize grip in the bottom-right corner (the window grows from its top-left corner)
-    local grip = New("TextButton", {
-        Name = "ResizeGrip",
-        Text = "",
-        AutoButtonColor = false,
-        BackgroundTransparency = 1,
-        AnchorPoint = Vector2.new(1, 1),
-        Position = UDim2.new(1, -4, 1, -4),
-        Size = UDim2.fromOffset(22, 22),
-        ZIndex = 8,
-    }, Pop)
-    Bar(grip, 14, 2, -45, 0.58, 0.58, THEME.Muted)
-    Bar(grip, 7, 2, -45, 0.78, 0.78, THEME.Muted)
-
-    local resizing, resizeStart, startSize, resizeOrigin = false, nil, nil, nil
-    grip.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            resizing, resizeStart, startSize, resizeOrigin = true, input.Position, Main.Size, Main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then resizing = false end
-            end)
-        end
-    end)
-    local resizeConnection = UserInputService.InputChanged:Connect(function(input)
-        if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = (input.Position - resizeStart) / UI_SCALE
-            local maxWidth = math.max(MIN_WIDTH, math.min(MAX_WIDTH, (screen.X - 24) / UI_SCALE))
-            local maxHeight = math.max(MIN_HEIGHT, math.min(MAX_HEIGHT, (screen.Y - 24) / UI_SCALE))
-            local width = math.clamp(startSize.X.Offset + delta.X, MIN_WIDTH, maxWidth)
-            local height = math.clamp(startSize.Y.Offset + delta.Y, MIN_HEIGHT, maxHeight)
-            Main.Size = UDim2.fromOffset(width, height)
-            Main.Position = UDim2.new(
-                resizeOrigin.X.Scale, resizeOrigin.X.Offset + (width - startSize.X.Offset) / 2,
-                resizeOrigin.Y.Scale, resizeOrigin.Y.Offset + (height - startSize.Y.Offset) / 2
-            )
-        end
-    end)
-    RegisterCleanup(function() resizeConnection:Disconnect() end)
-
-    -- floating round open button (like Mugiwara UI's), shown while the window is hidden
-    local OpenButton = New("TextButton", {
-        Name = "OpenButton",
-        Text = "",
-        AutoButtonColor = false,
-        BorderSizePixel = 0,
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(0, 36, 0.5, 0),
-        Size = UDim2.fromOffset(0, 0),
-        BackgroundColor3 = THEME.Popup,
-        BackgroundTransparency = THEME.PopupAlpha,
-        Visible = false,
-    }, Gui)
-    New("UICorner", { CornerRadius = UDim.new(1, 0) }, OpenButton)
-    New("UIScale", { Scale = UI_SCALE }, OpenButton)
-    Spin(Gradient(Stroke(OpenButton, 0.15, 2), 0, CYCLE), 6)
-    Spin(Gradient(Stroke(OpenButton, 0.7, 6), 0, CYCLE), 6)
-    local openMark = Label(OpenButton, {
-        Text = "V",
-        Font = Enum.Font.GothamBlack,
-        TextSize = 22,
-        TextColor3 = Color3.new(1, 1, 1),
-        TextXAlignment = Enum.TextXAlignment.Center,
-        Size = UDim2.fromScale(1, 1),
-    })
-    Gradient(openMark, 45)
-
-    local opened = true
-    local function SetOpen(state)
-        if state == opened then return end
-        opened = state
-        if state then
-            Main.Visible = true
-            PopScale.Scale = 0.9
-            Tween(PopScale, { Scale = 1 }, 0.5, Enum.EasingStyle.Quint)
-            Tween(Win, { GroupTransparency = 0 }, 0.3)
-            for _, ring in ipairs(glowRings) do Tween(ring.Stroke, { Transparency = ring.Base }, 0.4) end
-            Tween(OpenButton, { Size = UDim2.fromOffset(0, 0) }, 0.18)
-            task.delay(0.18, function()
-                if opened then OpenButton.Visible = false end
-            end)
-        else
-            Tween(PopScale, { Scale = 0.92 }, 0.3, Enum.EasingStyle.Quint)
-            Tween(Win, { GroupTransparency = 1 }, 0.24)
-            for _, ring in ipairs(glowRings) do Tween(ring.Stroke, { Transparency = 1 }, 0.2) end
-            task.delay(0.3, function()
-                if not opened then Main.Visible = false end
-            end)
-            OpenButton.Visible = true
-            Tween(OpenButton, { Size = UDim2.fromOffset(52, 52) }, 0.5, Enum.EasingStyle.Back)
-        end
-    end
-
-    -- the open button can be dragged; a tap (no drag) opens the window again
-    local pressed, moved, pressStart, pressPosition = false, false, nil, nil
-    OpenButton.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            pressed, moved, pressStart, pressPosition = true, false, input.Position, OpenButton.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    pressed = false
-                    if not moved then SetOpen(true) end
-                end
-            end)
-        end
-    end)
-    local openMoveConnection = UserInputService.InputChanged:Connect(function(input)
-        if pressed and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = (input.Position - pressStart) / UI_SCALE
-            if delta.Magnitude * UI_SCALE > 6 then moved = true end
-            if moved then
-                OpenButton.Position = UDim2.new(pressPosition.X.Scale, pressPosition.X.Offset + delta.X, pressPosition.Y.Scale, pressPosition.Y.Offset + delta.Y)
-            end
-        end
-    end)
-    RegisterCleanup(function() openMoveConnection:Disconnect() end)
-
-    MinimizeButton.MouseButton1Click:Connect(function() SetOpen(false) end)
-
-    local keyConnection = UserInputService.InputBegan:Connect(function(input, processed)
-        if processed or UserInputService:GetFocusedTextBox() then return end
-        if input.KeyCode == Enum.KeyCode.K then SetOpen(not opened) end
-    end)
-    RegisterCleanup(function() keyConnection:Disconnect() end)
-
-    -- close asks first: every swapped carry is put back, and the script has to be run again to reopen
-    local dialogOpen = false
-    local function ConfirmClose()
-        if dialogOpen then return end
-        dialogOpen = true
-
-        local overlay = New("TextButton", {
-            Name = "Dialog",
-            Text = "",
-            AutoButtonColor = false,
-            BorderSizePixel = 0,
-            Size = UDim2.fromScale(1, 1),
-            BackgroundColor3 = Color3.new(0, 0, 0),
-            BackgroundTransparency = 1,
-            ZIndex = 50,
-        }, Win)
-        Tween(overlay, { BackgroundTransparency = 0.42 }, 0.25)
-
-        local card = New("CanvasGroup", {
-            AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.fromScale(0.5, 0.5),
-            Size = UDim2.new(0, 330, 0, 0),
-            AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundColor3 = THEME.Popup,
-            BackgroundTransparency = THEME.PopupAlpha,
-            GroupTransparency = 1,
-            BorderSizePixel = 0,
-            Active = true,
-            ZIndex = 51,
-        }, overlay)
-        Round(card, 14)
-        local outline = Stroke(card, 1, 1.4, Color3.new(1, 1, 1))
-        Spin(Gradient(outline, 45, CYCLE), 8)
-        New("UIPadding", {
-            PaddingTop = UDim.new(0, 18), PaddingBottom = UDim.new(0, 18),
-            PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18),
-        }, card)
-        New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10) }, card)
-        local cardScale = New("UIScale", { Scale = 0.9 }, card)
-        Tween(cardScale, { Scale = 1 }, 0.4, Enum.EasingStyle.Quint)
-        Tween(card, { GroupTransparency = 0 }, 0.25)
-        Tween(outline, { Transparency = 0.3 }, 0.25)
-
-        local title = Label(card, {
-            Text = "Close Visual Carry?",
-            Font = FONT_TITLE,
-            TextSize = 16,
-            TextColor3 = Color3.new(1, 1, 1),
-            TextWrapped = true,
-            AutomaticSize = Enum.AutomaticSize.Y,
-            Size = UDim2.new(1, 0, 0, 0),
-            LayoutOrder = 1,
-        })
-        Gradient(title, 0)
-        Label(card, {
-            Text = "The interface will be closed and every swapped carry will be put back to normal. Run the script again to reopen it.",
-            TextSize = 14,
-            TextColor3 = THEME.SubText,
-            TextWrapped = true,
-            AutomaticSize = Enum.AutomaticSize.Y,
-            Size = UDim2.new(1, 0, 0, 0),
-            LayoutOrder = 2,
-        })
-
-        local row = New("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1, LayoutOrder = 3 }, card)
-        New("UIListLayout", {
-            FillDirection = Enum.FillDirection.Horizontal,
-            HorizontalAlignment = Enum.HorizontalAlignment.Right,
-            SortOrder = Enum.SortOrder.LayoutOrder,
-            Padding = UDim.new(0, 8),
-        }, row)
-
-        local function CloseDialog()
-            Tween(cardScale, { Scale = 0.93 }, 0.2)
-            Tween(card, { GroupTransparency = 1 }, 0.2)
-            Tween(outline, { Transparency = 1 }, 0.2)
-            Tween(overlay, { BackgroundTransparency = 1 }, 0.2)
-            task.delay(0.22, function()
-                overlay:Destroy()
-                dialogOpen = false
-            end)
-        end
-
-        local function DialogButton(text, danger, order, callback)
-            local button = New("TextButton", {
-                Text = text,
-                Font = FONT_TITLE,
-                TextSize = 13,
-                TextColor3 = danger and THEME.OnAccent or THEME.Text,
-                AutoButtonColor = false,
-                BorderSizePixel = 0,
-                AutomaticSize = Enum.AutomaticSize.X,
-                Size = UDim2.fromOffset(0, 36),
-                BackgroundColor3 = danger and THEME.Danger or THEME.Card,
-                BackgroundTransparency = danger and 0 or 0.84,
-                LayoutOrder = order,
-            }, row)
-            Round(button, 9)
-            New("UIPadding", { PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18) }, button)
-            button.MouseButton1Click:Connect(callback)
-        end
-
-        DialogButton("Cancel", false, 1, CloseDialog)
-        DialogButton("Close", true, 2, function()
-            local fns = cleanupFns
-            cleanupFns = {}
-            for _, fn in ipairs(fns) do pcall(fn) end
-        end)
-    end
-    CloseButton.MouseButton1Click:Connect(ConfirmClose)
-
-    -- open animation: pop in and fade the glow up
-    Tween(PopScale, { Scale = 1 }, 0.45, Enum.EasingStyle.Back)
-    Tween(Win, { GroupTransparency = 0 }, 0.35)
-    for _, ring in ipairs(glowRings) do Tween(ring.Stroke, { Transparency = ring.Base }, 0.45) end
-end
 
 -- ==========================================================
 -- Carry grid logic (ported from Games/Evade/VisualGridUI.lua, rebuilt on the UI above)
@@ -2094,6 +2328,9 @@ local function BuildCarryUI(Swap)
     end)
 
     Refresh()
+    Page.OnShow = function()
+        for _, side in pairs(sides) do RefreshVisible(side) end
+    end
 
     -- Poses of every carry are gathered quietly in the background (once; saved to a file), so
     -- opening any category later is instant.
