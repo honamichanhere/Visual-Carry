@@ -973,6 +973,7 @@ local function NewSwap(config)
             Header = type(header) == "string" and header or "Other",
             Id = id,
             Instance = instance,
+            Info = info,
         }
         table.insert(entries, entry)
         byInstance[instance] = entry
@@ -1092,6 +1093,51 @@ local function NewSwap(config)
         end
     end
 
+    -- The name and description the game shows come from the item module's table (cached by require, so
+    -- shared with the game), so they are swapped there too and put back on Revert. A locked (read-only)
+    -- table is opened with the executor's setreadonly when it has one; if that is not possible the names
+    -- are simply left alone and the swap itself still works.
+    local nameBackup = {}
+
+    local function Appearance(entry)
+        local info = entry.Info
+        local appearance = type(info) == "table" and info.AppearanceInfo or nil
+        return type(appearance) == "table" and appearance or nil
+    end
+
+    local function SetNames(entry, name, desc)
+        local appearance = Appearance(entry)
+        if not appearance then return false end
+        local frozen = (table.isfrozen and table.isfrozen(appearance)) or (isreadonly and isreadonly(appearance))
+        if frozen and setreadonly then pcall(setreadonly, appearance, false) end
+        return (pcall(function()
+            appearance.Name = name
+            appearance.Desc = desc
+        end))
+    end
+
+    local function RestoreNames(entry)
+        local backup = nameBackup[entry.Instance]
+        if backup then
+            SetNames(entry, backup.Name, backup.Desc)
+            nameBackup[entry.Instance] = nil
+        end
+    end
+
+    local function SwapNames(a, b)
+        local appearanceA, appearanceB = Appearance(a), Appearance(b)
+        if not (appearanceA and appearanceB) then return end
+        nameBackup[a.Instance] = nameBackup[a.Instance] or { Name = appearanceA.Name, Desc = appearanceA.Desc }
+        nameBackup[b.Instance] = nameBackup[b.Instance] or { Name = appearanceB.Name, Desc = appearanceB.Desc }
+        local nameA, descA = appearanceA.Name, appearanceA.Desc
+        local okA = SetNames(a, appearanceB.Name, appearanceB.Desc)
+        local okB = SetNames(b, nameA, descA)
+        if not (okA and okB) then
+            RestoreNames(a)
+            RestoreNames(b)
+        end
+    end
+
     function Swap.Swap(base, target)
         if Swap.GetState(base, target) ~= 2 then
             return false, "Please make sure you picked a valid Base and Target " .. NOUN .. "."
@@ -1105,6 +1151,7 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The swap failed: " .. tostring(err) end
 
+        pcall(SwapNames, base, target)
         swapped[base.Instance] = target.Instance
         swapped[target.Instance] = base.Instance
         return true, base.Display .. " ⇌ " .. target.Display
@@ -1121,6 +1168,10 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The revert failed: " .. tostring(err) end
 
+        pcall(function()
+            RestoreNames(base)
+            RestoreNames(target)
+        end)
         swapped[base.Instance] = nil
         swapped[target.Instance] = nil
         return true, base.Display .. " and " .. target.Display .. " were restored."
