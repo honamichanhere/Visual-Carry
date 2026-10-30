@@ -1093,11 +1093,15 @@ local function NewSwap(config)
         end
     end
 
-    -- The name and description the game shows come from the item module's table (cached by require, so
-    -- shared with the game), so they are swapped there too and put back on Revert. A locked (read-only)
-    -- table is opened with the executor's setreadonly when it has one; if that is not possible the names
-    -- are simply left alone and the swap itself still works.
-    local nameBackup = {}
+    -- The game writes each name into its labels itself (the emote wheel when the loadout is set, menu slots when
+    -- they are built), always the item's ORIGINAL name, and it rebuilds them whenever a page changes. So the
+    -- names are never touched in the item data: a background watcher (like the Unusual one) keeps rewriting any
+    -- label of a swapped item to its partner's name, including labels the game builds or resets later.
+    -- A label we rewrote is remembered with the text we gave it; a label that shows an original name and is
+    -- not one of ours was just written by the game, so it is rewritten again. Revert puts the old text back.
+    local nameMap = {}      -- original text -> text to show (names and descriptions, also upper-case)
+    local rewritten = setmetatable({}, { __mode = "k" }) -- label -> { Expected, Original }
+    local watching = false
 
     local function Appearance(entry)
         local info = entry.Info
@@ -1105,64 +1109,77 @@ local function NewSwap(config)
         return type(appearance) == "table" and appearance or nil
     end
 
-    local function SetNames(entry, name, desc)
-        local appearance = Appearance(entry)
-        if not appearance then return false end
-        local frozen = (table.isfrozen and table.isfrozen(appearance)) or (isreadonly and isreadonly(appearance))
-        if frozen and setreadonly then pcall(setreadonly, appearance, false) end
-        return (pcall(function()
-            appearance.Name = name
-            appearance.Desc = desc
-        end))
-    end
-
-    local function RestoreNames(entry)
-        local backup = nameBackup[entry.Instance]
-        if backup then
-            SetNames(entry, backup.Name, backup.Desc)
-            nameBackup[entry.Instance] = nil
+    local function MapText(from, to, on)
+        if type(from) ~= "string" or type(to) ~= "string" or from == "" or from == to then return end
+        local upper = string.upper(from)
+        if on then
+            nameMap[from] = to
+            nameMap[upper] = string.upper(to)
+        else
+            nameMap[from] = nil
+            nameMap[upper] = nil
         end
     end
 
-    -- The game writes names into its labels once (the emote wheel at SetEquipped, menu slots when built), so
-    -- labels that already exist keep the old text. Exact-text matches in the player GUI are rewritten to follow
-    -- the swap (also the upper-case form some menus use).
-    local function Relabel(map)
-        local full = {}
-        for from, to in pairs(map) do
-            if type(from) == "string" and type(to) == "string" and from ~= "" and from ~= to then
-                full[from] = to
-                full[string.upper(from)] = string.upper(to)
-            end
-        end
-        if next(full) == nil then return end
-        local playerGui = Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if not playerGui then return end
-        for _, gui in ipairs(playerGui:GetDescendants()) do
-            if gui:IsA("TextLabel") or gui:IsA("TextButton") then
-                local replacement = full[gui.Text]
-                if replacement then gui.Text = replacement end
+    local function PlayerGui()
+        local player = Players.LocalPlayer
+        return player and player:FindFirstChildOfClass("PlayerGui")
+    end
+
+    local function Enforce()
+        local gui = PlayerGui()
+        if not gui then return end
+        for _, label in ipairs(gui:GetDescendants()) do
+            if label:IsA("TextLabel") or label:IsA("TextButton") then
+                local text = label.Text
+                local record = rewritten[label]
+                local want = nameMap[text]
+                if want and not (record and record.Expected == text) then
+                    rewritten[label] = { Expected = want, Original = text }
+                    label.Text = want
+                elseif record and record.Expected ~= text then
+                    rewritten[label] = nil
+                end
             end
         end
     end
 
-    local function NamesOf(entry)
-        local appearance = Appearance(entry)
-        if not appearance then return nil, nil end
-        return appearance.Name, appearance.Desc
+    local function Watch()
+        if watching then return end
+        watching = true
+        task.spawn(function()
+            while next(nameMap) ~= nil do
+                pcall(Enforce)
+                task.wait(0.25)
+            end
+            watching = false
+        end)
     end
 
-    local function SwapNames(a, b)
+    local function LinkNames(a, b)
         local appearanceA, appearanceB = Appearance(a), Appearance(b)
         if not (appearanceA and appearanceB) then return end
-        nameBackup[a.Instance] = nameBackup[a.Instance] or { Name = appearanceA.Name, Desc = appearanceA.Desc }
-        nameBackup[b.Instance] = nameBackup[b.Instance] or { Name = appearanceB.Name, Desc = appearanceB.Desc }
-        local nameA, descA = appearanceA.Name, appearanceA.Desc
-        local okA = SetNames(a, appearanceB.Name, appearanceB.Desc)
-        local okB = SetNames(b, nameA, descA)
-        if not (okA and okB) then
-            RestoreNames(a)
-            RestoreNames(b)
+        MapText(appearanceA.Name, appearanceB.Name, true)
+        MapText(appearanceB.Name, appearanceA.Name, true)
+        MapText(appearanceA.Desc, appearanceB.Desc, true)
+        MapText(appearanceB.Desc, appearanceA.Desc, true)
+        pcall(Enforce)
+        Watch()
+    end
+
+    local function UnlinkNames(a, b)
+        local appearanceA, appearanceB = Appearance(a), Appearance(b)
+        if not (appearanceA and appearanceB) then return end
+        MapText(appearanceA.Name, appearanceB.Name, false)
+        MapText(appearanceB.Name, appearanceA.Name, false)
+        MapText(appearanceA.Desc, appearanceB.Desc, false)
+        MapText(appearanceB.Desc, appearanceA.Desc, false)
+        -- labels we rewrote that are still showing our text go back to what the game wrote
+        for label, record in pairs(rewritten) do
+            if record.Expected == label.Text and nameMap[record.Original] == nil then
+                label.Text = record.Original
+                rewritten[label] = nil
+            end
         end
     end
 
@@ -1179,12 +1196,7 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The swap failed: " .. tostring(err) end
 
-        pcall(function()
-            local nameA, descA = NamesOf(base)
-            local nameB, descB = NamesOf(target)
-            SwapNames(base, target)
-            Relabel({ [nameA] = nameB, [nameB] = nameA, [descA] = descB, [descB] = descA })
-        end)
+        pcall(LinkNames, base, target)
         swapped[base.Instance] = target.Instance
         swapped[target.Instance] = base.Instance
         return true, base.Display .. " ⇌ " .. target.Display
@@ -1201,15 +1213,7 @@ local function NewSwap(config)
         end)
         if not ok then return false, "The revert failed: " .. tostring(err) end
 
-        pcall(function()
-            local nowA, nowDescA = NamesOf(base)
-            local nowB, nowDescB = NamesOf(target)
-            RestoreNames(base)
-            RestoreNames(target)
-            local backA, backDescA = NamesOf(base)
-            local backB, backDescB = NamesOf(target)
-            Relabel({ [nowA] = backA, [nowB] = backB, [nowDescA] = backDescA, [nowDescB] = backDescB })
-        end)
+        pcall(UnlinkNames, base, target)
         swapped[base.Instance] = nil
         swapped[target.Instance] = nil
         return true, base.Display .. " and " .. target.Display .. " were restored."
